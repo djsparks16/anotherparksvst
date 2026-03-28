@@ -1,0 +1,656 @@
+#pragma once
+
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_dsp/juce_dsp.h>
+#include <array>
+#include <algorithm>
+#include <cmath>
+
+struct StereoSample
+{
+    float left = 0.0f;
+    float right = 0.0f;
+};
+
+enum class ModSource : int
+{
+    none = 0,
+    env2,
+    env3,
+    lfo1,
+    lfo2,
+    lfo3,
+    lfo4,
+    velocity
+};
+
+enum class ModDestination : int
+{
+    none = 0,
+    filterCutoff,
+    oscAPos,
+    oscBPos,
+    pitch,
+    level,
+    pan,
+    distortion,
+    fxMix
+};
+
+struct ModSlot
+{
+    ModSource source = ModSource::none;
+    ModDestination destination = ModDestination::none;
+    float amount = 0.0f;
+};
+
+struct RuntimeParams
+{
+    int playMode = 2;
+    float glideMs = 35.0f;
+
+    int oscAOct = 0, oscASemi = 0;
+    float oscAFine = 0.0f, oscAUnison = 3.0f, oscADetune = 0.18f, oscABlend = 0.76f, oscAPhase = 0.0f, oscARand = 0.0f, oscAPos = 0.25f, oscALevel = 0.85f, oscAPan = 0.5f;
+    int oscBOct = 0, oscBSemi = 7;
+    float oscBFine = 0.0f, oscBUnison = 2.0f, oscBDetune = 0.14f, oscBBlend = 0.68f, oscBPhase = 0.0f, oscBRand = 0.0f, oscBPos = 0.58f, oscBLevel = 0.70f, oscBPan = 0.5f;
+
+    float subLevel = 0.7f; int subWave = 0; bool subDirect = false;
+    int noiseType = 0; float noisePitch = 0.5f, noisePhase = 0.0f, noisePan = 0.5f, noiseLevel = 0.0f; bool noiseDirect = false;
+
+    int filterMode = 0; float cutoff = 1200.0f, resonance = 0.25f, filterDrive = 0.2f, filterMix = 1.0f, filterPan = 0.5f;
+    int bassMode = 0;
+    float reeseAmount = 0.0f, warhornAmount = 0.0f, wompAmount = 0.0f, subHarmonic = 0.0f, comboAmount = 0.0f, stereoWidth = 0.5f, fmAmount = 0.0f, airAmount = 0.0f;
+    float bodyAmount = 0.0f, growlAmount = 0.0f, toneAmount = 0.5f, motionAmount = 0.0f;
+    float screechAmount = 0.0f, whoopAmount = 0.0f, vowelAmount = 0.0f, smearAmount = 0.0f;
+
+    float env1A = 0.005f, env1H = 0.0f, env1D = 0.25f, env1S = 0.75f, env1R = 0.2f;
+    float env2A = 0.001f, env2H = 0.0f, env2D = 0.3f, env2S = 0.0f, env2R = 0.2f;
+    float env3A = 0.001f, env3H = 0.0f, env3D = 0.4f, env3S = 0.0f, env3R = 0.2f;
+
+    std::array<float, 4> lfoRate { 1.0f, 0.3f, 3.0f, 0.11f };
+    std::array<float, 4> lfoAmount { 0.0f, 0.0f, 0.0f, 0.0f };
+    std::array<float, 4> lfoShape { 0.0f, 0.3f, 0.7f, 1.0f };
+    std::array<float, 4> lfoSmooth { 0.1f, 0.1f, 0.1f, 0.1f };
+    std::array<int, 4> lfoSync { 0, 0, 0, 0 };
+
+    std::array<ModSlot, 6> matrix {};
+
+    float distDrive = 0.25f, distMix = 0.4f;
+    float chorusMix = 0.15f, delayMix = 0.12f, reverbMix = 0.08f, compAmt = 0.2f;
+
+    int polyphony = 8;
+    float masterGain = 0.7f;
+};
+
+struct WavetableOscillator
+{
+    double sampleRate = 44100.0;
+    float phase = 0.0f;
+    float wavePos = 0.25f;
+    float frequency = 110.0f;
+
+    void prepare(double sr) { sampleRate = sr; phase = 0.0f; }
+    void setFrequency(float hz) { frequency = juce::jmax(0.0f, hz); }
+    void setPosition(float p) { wavePos = juce::jlimit(0.0f, 1.0f, p); }
+    void setPhase(float p) { phase = p - std::floor(p); }
+
+    float frame(float p, float pos) const
+    {
+        const float s = std::sin(juce::MathConstants<float>::twoPi * p);
+        const float tri = 2.0f * std::abs(2.0f * p - 1.0f) - 1.0f;
+        const float saw = 2.0f * p - 1.0f;
+        const float square = p < 0.5f ? 1.0f : -1.0f;
+        const float vocal = std::sin(juce::MathConstants<float>::twoPi * p + 2.2f * std::sin(juce::MathConstants<float>::twoPi * p));
+        const float formant = std::sin(juce::MathConstants<float>::twoPi * p * (1.0f + 1.5f * std::sin(juce::MathConstants<float>::twoPi * p))) * (0.6f + 0.4f * saw);
+        const float folded = std::sin((2.0f + 6.0f * pos) * juce::MathConstants<float>::twoPi * p) * 0.65f + saw * 0.35f;
+        if (pos < 0.20f) return juce::jmap(pos / 0.20f, s, tri);
+        if (pos < 0.40f) return juce::jmap((pos - 0.20f) / 0.20f, tri, saw);
+        if (pos < 0.60f) return juce::jmap((pos - 0.40f) / 0.20f, saw, square);
+        if (pos < 0.80f) return juce::jmap((pos - 0.60f) / 0.20f, square, vocal);
+        const float laser = std::sin(juce::MathConstants<float>::twoPi * p * (8.0f + 18.0f * pos)) * 0.6f + square * 0.4f;
+        if (pos < 0.90f) return juce::jmap((pos - 0.80f) / 0.10f, vocal, formant);
+        if (pos < 0.97f) return juce::jmap((pos - 0.90f) / 0.07f, formant, folded);
+        return juce::jmap((pos - 0.97f) / 0.03f, folded, laser);
+    }
+
+    float process(float phaseOffset = 0.0f)
+    {
+        const float p = juce::jlimit(0.0f, 1.0f, phase + phaseOffset - std::floor(phase + phaseOffset));
+        const float y = frame(p, wavePos);
+        phase += frequency / (float) sampleRate;
+        phase -= std::floor(phase);
+        return y;
+    }
+};
+
+struct ModEnvelope
+{
+    juce::ADSR adsr;
+    juce::ADSR::Parameters params;
+
+    void prepare(double sr) { adsr.setSampleRate(sr); }
+    void set(float a, float d, float s, float r)
+    {
+        params.attack = juce::jmax(0.005f, a);
+        params.decay = juce::jmax(0.001f, d);
+        params.sustain = juce::jlimit(0.0f, 1.0f, s);
+        params.release = juce::jmax(0.01f, r);
+        adsr.setParameters(params);
+    }
+    void noteOn() { adsr.noteOn(); }
+    void noteOff() { adsr.noteOff(); }
+    float next() { return adsr.getNextSample(); }
+    bool isActive() const { return adsr.isActive(); }
+};
+
+struct ShapedLfo
+{
+    double sampleRate = 44100.0;
+    float phase = 0.0f;
+    float out = 0.0f;
+    void prepare(double sr) { sampleRate = sr; phase = 0.0f; out = 0.0f; }
+
+    float shapeValue(float p, float shape) const
+    {
+        const float sine = std::sin(juce::MathConstants<float>::twoPi * p);
+        const float tri = 1.0f - 4.0f * std::abs(p - 0.5f);
+        const float saw = 2.0f * p - 1.0f;
+        const float step = p < 0.5f ? -1.0f : 1.0f;
+        if (shape < 0.33f) return juce::jmap(shape / 0.33f, sine, tri);
+        if (shape < 0.66f) return juce::jmap((shape - 0.33f) / 0.33f, tri, saw);
+        return juce::jmap((shape - 0.66f) / 0.34f, saw, step);
+    }
+
+    float process(float rate, float shape, float smooth)
+    {
+        phase += rate / (float) sampleRate;
+        phase -= std::floor(phase);
+        const float target = shapeValue(phase, juce::jlimit(0.0f, 1.0f, shape));
+        const float alpha = juce::jlimit(0.001f, 1.0f, 1.0f - smooth * 0.95f);
+        out += (target - out) * alpha;
+        return out;
+    }
+};
+
+struct FilterBlock
+{
+    juce::dsp::StateVariableTPTFilter<float> left, right;
+
+    void prepare(double sr, int blockSize)
+    {
+        juce::dsp::ProcessSpec spec { sr, (juce::uint32) blockSize, 1 };
+        left.prepare(spec);
+        right.prepare(spec);
+        left.reset();
+        right.reset();
+    }
+
+    void update(int mode, float cutoff, float resonance)
+    {
+        auto t = juce::dsp::StateVariableTPTFilterType::lowpass;
+        if (mode == 1) t = juce::dsp::StateVariableTPTFilterType::bandpass;
+        else if (mode == 2) t = juce::dsp::StateVariableTPTFilterType::highpass;
+        else if (mode == 3) t = juce::dsp::StateVariableTPTFilterType::bandpass;
+        else if (mode == 4) t = juce::dsp::StateVariableTPTFilterType::highpass;
+        left.setType(t); right.setType(t);
+        left.setCutoffFrequency(cutoff); right.setCutoffFrequency(cutoff);
+        left.setResonance(resonance); right.setResonance(resonance);
+    }
+
+    StereoSample process(float l, float r) { return { left.processSample(0, l), right.processSample(0, r) }; }
+};
+
+class FiveParksVoice
+{
+public:
+    void prepare(double sr, int blockSize)
+    {
+        sampleRate = sr;
+        oscA.prepare(sr); oscB.prepare(sr); sub.prepare(sr); noise.prepare(sr);
+        for (auto& o : extraA) o.prepare(sr);
+        for (auto& o : extraB) o.prepare(sr);
+        env1.prepare(sr); env2.prepare(sr); env3.prepare(sr);
+        for (auto& l : lfos) l.prepare(sr);
+        filter.prepare(sr, blockSize);
+        reset();
+    }
+
+    void reset()
+    {
+        active = false; held = false; velocity = 0.0f; currentHz = targetHz = 110.0f; midiNote = -1;
+        age = 0; basePan = 0.5f; releaseSamples = 0; onsetSamples = 0; postToneL = postToneR = 0.0f; warmToneL = warmToneR = 0.0f; subToneState = 0.0f; subPostState = 0.0f; noiseDcState = 0.0f;
+    }
+
+    bool isActive() const { return active; }
+    int getMidiNote() const { return midiNote; }
+    uint64_t getAge() const { return age; }
+    float getVelocity() const { return velocity; }
+
+    void start(int note, float vel, const RuntimeParams& p, uint64_t newAge)
+    {
+        active = true; held = true; midiNote = note; velocity = vel; age = newAge; releaseSamples = 0; onsetSamples = 0; postToneL = postToneR = 0.0f; warmToneL = warmToneR = 0.0f; subToneState = 0.0f; noiseDcState = 0.0f; subPostState = 0.0f;
+        targetHz = currentHz = (float) juce::MidiMessage::getMidiNoteInHertz(note);
+        env1.set(p.env1A, p.env1D, p.env1S, p.env1R);
+        env2.set(p.env2A, p.env2D, p.env2S, p.env2R);
+        env3.set(p.env3A, p.env3D, p.env3S, p.env3R);
+        env1.noteOn(); env2.noteOn(); env3.noteOn();
+        const float seed = std::sin((float) note * 12.345f) * 43758.5453f;
+        const float rnd = seed - std::floor(seed);
+        const float randA = p.oscARand > 0.001f ? rnd * p.oscARand : 0.0f;
+        const float randB = p.oscBRand > 0.001f ? rnd * p.oscBRand : 0.0f;
+        oscA.setPhase(p.oscAPhase + randA);
+        oscB.setPhase(p.oscBPhase + randB);
+        sub.setPhase(0.0f);
+        noise.setPhase(p.noisePhase);
+        for (size_t i = 0; i < extraA.size(); ++i)
+            extraA[i].setPhase(p.oscAPhase + 0.07f * (float) i + randA);
+        for (size_t i = 0; i < extraB.size(); ++i)
+            extraB[i].setPhase(p.oscBPhase + 0.05f * (float) i + randB);
+        basePan = juce::jlimit(0.0f, 1.0f, 0.5f + (rnd - 0.5f) * 0.25f);
+    }
+
+    void retarget(int note, float vel, const RuntimeParams& p, uint64_t newAge, bool retrigger)
+    {
+        active = true; held = true; midiNote = note; velocity = vel; age = newAge; releaseSamples = 0;
+        targetHz = (float) juce::MidiMessage::getMidiNoteInHertz(note);
+        env1.set(p.env1A, p.env1D, p.env1S, p.env1R);
+        env2.set(p.env2A, p.env2D, p.env2S, p.env2R);
+        env3.set(p.env3A, p.env3D, p.env3S, p.env3R);
+        if (retrigger)
+        {
+            onsetSamples = 0;
+            postToneL = postToneR = 0.0f;
+            warmToneL = warmToneR = 0.0f;
+            subToneState = 0.0f;
+            noiseDcState = 0.0f;
+            subPostState = 0.0f;
+            currentHz = targetHz;
+            env1.noteOn(); env2.noteOn(); env3.noteOn();
+            const float seed = std::sin((float) note * 12.345f) * 43758.5453f;
+            const float rnd = seed - std::floor(seed);
+            const float randA = p.oscARand > 0.001f ? rnd * p.oscARand : 0.0f;
+            const float randB = p.oscBRand > 0.001f ? rnd * p.oscBRand : 0.0f;
+            oscA.setPhase(p.oscAPhase + randA);
+            oscB.setPhase(p.oscBPhase + randB);
+            sub.setPhase(0.0f);
+            noise.setPhase(p.noisePhase);
+        }
+        else
+        {
+            held = true;
+        }
+    }
+
+    void stop() { held = false; releaseSamples = 0; env1.noteOff(); env2.noteOff(); env3.noteOff(); }
+    void forceKill() { reset(); }
+
+    StereoSample render(const RuntimeParams& p)
+    {
+        if (! active) return {};
+
+        const float glideCoeff = p.glideMs <= 0.0f ? 1.0f : (1.0f - std::exp(-1.0f / (0.001f * p.glideMs * (float) sampleRate)));
+        currentHz += (targetHz - currentHz) * glideCoeff;
+
+        const float env2v = env2.next();
+        const float env3v = env3.next();
+        std::array<float, 4> lfoValues {};
+        for (size_t i = 0; i < 4; ++i)
+            lfoValues[i] = lfos[i].process(p.lfoRate[i], p.lfoShape[i], p.lfoSmooth[i]) * p.lfoAmount[i];
+
+        auto modValue = [&](ModSource src)
+        {
+            switch (src)
+            {
+                case ModSource::env2: return env2v;
+                case ModSource::env3: return env3v;
+                case ModSource::lfo1: return lfoValues[0];
+                case ModSource::lfo2: return lfoValues[1];
+                case ModSource::lfo3: return lfoValues[2];
+                case ModSource::lfo4: return lfoValues[3];
+                case ModSource::velocity: return velocity;
+                default: return 0.0f;
+            }
+        };
+
+        float modCutoff = 0.0f, modAPos = 0.0f, modBPos = 0.0f, modPitch = 0.0f, modLevel = 0.0f, modPan = 0.0f, modDist = 0.0f, modFx = 0.0f;
+        for (const auto& slot : p.matrix)
+        {
+            const float v = modValue(slot.source) * slot.amount;
+            switch (slot.destination)
+            {
+                case ModDestination::filterCutoff: modCutoff += v; break;
+                case ModDestination::oscAPos:      modAPos += v; break;
+                case ModDestination::oscBPos:      modBPos += v; break;
+                case ModDestination::pitch:        modPitch += v; break;
+                case ModDestination::level:        modLevel += v; break;
+                case ModDestination::pan:          modPan += v; break;
+                case ModDestination::distortion:   modDist += v; break;
+                case ModDestination::fxMix:        modFx += v; break;
+                default: break;
+            }
+        }
+
+        float modeReese = 0.0f, modeWomp = 0.0f, modeScreech = 0.0f, modeWarhorn = 0.0f, modeWhoop = 0.0f, modeDonk = 0.0f, modeTear = 0.0f, modeLaser = 0.0f, modeNeuro = 0.0f, modeHornStab = 0.0f, modeVapor = 0.0f;
+        switch (p.bassMode)
+        {
+            case 1: modeReese = 0.35f; break;
+            case 2: modeWomp = 0.45f; break;
+            case 3: modeScreech = 0.55f; break;
+            case 4: modeWarhorn = 0.55f; break;
+            case 5: modeWhoop = 0.45f; break;
+            case 6: modeDonk = 0.45f; break;
+            case 7: modeTear = 0.65f; break;
+            case 8: modeLaser = 0.60f; break;
+            case 9: modeNeuro = 0.55f; break;
+            case 10: modeHornStab = 0.60f; break;
+            case 11: modeVapor = 0.50f; break;
+            default: break;
+        }
+
+        const float macroReese = juce::jlimit(0.0f, 1.0f, p.reeseAmount + modeReese);
+        const float macroWomp = juce::jlimit(0.0f, 1.0f, p.wompAmount + modeWomp);
+        const float macroWarhorn = juce::jlimit(0.0f, 1.0f, p.warhornAmount + modeWarhorn);
+        const float macroScreech = juce::jlimit(0.0f, 1.0f, p.screechAmount + modeScreech + modeTear * 0.35f);
+        const float macroWhoop = juce::jlimit(0.0f, 1.0f, p.whoopAmount + modeWhoop);
+        const float macroDonk = juce::jlimit(0.0f, 1.0f, p.bodyAmount * 0.35f + modeDonk);
+        const float macroLaser = juce::jlimit(0.0f, 1.0f, p.airAmount * 0.25f + p.screechAmount * 0.25f + modeLaser);
+        const float macroNeuro = juce::jlimit(0.0f, 1.0f, p.growlAmount * 0.30f + p.motionAmount * 0.25f + modeNeuro);
+        const float macroHornStab = juce::jlimit(0.0f, 1.0f, p.warhornAmount * 0.35f + modeHornStab);
+        const float macroVapor = juce::jlimit(0.0f, 1.0f, p.smearAmount * 0.30f + p.airAmount * 0.20f + modeVapor);
+        const float motion = juce::jlimit(-1.0f, 1.0f, lfoValues[0] * (0.45f + 0.9f * p.motionAmount + 0.55f * macroWomp + 0.28f * macroNeuro) + lfoValues[1] * (0.35f * p.motionAmount + 0.18f * macroWhoop + 0.22f * macroVapor) + env3v * 0.2f * p.motionAmount);
+        const float pitchRatio = std::pow(2.0f, modPitch * 0.25f + motion * (0.03f + 0.05f * macroWhoop));
+        const float wobble = 1.0f + (macroWomp * 0.55f + p.motionAmount * 0.25f + macroWhoop * 0.15f) * lfoValues[0];
+        const float screamWarp = 1.0f + macroScreech * 0.04f * (lfoValues[2] + env2v);
+        const float hzA = currentHz * std::pow(2.0f, (float) (12 * p.oscAOct + p.oscASemi) / 12.0f) * std::pow(2.0f, p.oscAFine / 1200.0f) * pitchRatio * wobble * screamWarp;
+        const float hzB = currentHz * std::pow(2.0f, (float) (12 * p.oscBOct + p.oscBSemi) / 12.0f) * std::pow(2.0f, p.oscBFine / 1200.0f) * pitchRatio * (1.0f - macroReese * 0.035f * lfoValues[1]) * (1.0f - macroWhoop * 0.02f * env2v);
+        const float hzSub = currentHz * juce::jmax(0.125f, 0.5f - 0.25f * p.subHarmonic) * std::pow(2.0f, modPitch * 0.06f);
+
+        oscA.setFrequency(hzA); oscB.setFrequency(hzB); sub.setFrequency(hzSub);
+        oscA.setPosition(p.oscAPos + modAPos * 0.35f + motion * (0.10f + 0.18f * p.motionAmount) + macroScreech * 0.12f * lfoValues[2] + p.vowelAmount * 0.08f * env2v);
+        oscB.setPosition(p.oscBPos + modBPos * 0.35f - motion * (0.12f + 0.20f * p.motionAmount) + macroWhoop * 0.10f * env3v - p.vowelAmount * 0.06f * lfoValues[1]);
+        noise.setFrequency(100.0f + p.noisePitch * 8000.0f);
+        switch (p.noiseType)
+        {
+            case 1: noise.setPosition(0.68f); break;
+            case 2: noise.setPosition(0.96f); break;
+            case 3: noise.setPosition(0.52f); break;
+            case 4: noise.setPosition(0.84f); break;
+            case 5: noise.setPosition(0.995f); break;
+            case 6: noise.setPosition(0.88f); break;
+            case 7: noise.setPosition(0.14f); break;
+            default: noise.setPosition(0.72f); break;
+        }
+
+        const float oscALevel = p.oscALevel <= 0.001f ? 0.0f : 0.95f * std::pow(p.oscALevel, 1.25f);
+        const float oscBLevel = p.oscBLevel <= 0.001f ? 0.0f : 0.90f * std::pow(p.oscBLevel, 1.30f);
+        const float subLevel = p.subLevel <= 0.001f ? 0.0f : 0.72f * std::pow(p.subLevel, 1.10f);
+        const float noiseLevel = p.noiseLevel <= 0.001f ? 0.0f : 0.16f * std::pow(p.noiseLevel, 1.80f);
+        const bool useOscA = oscALevel > 0.0f;
+        const bool useOscB = oscBLevel > 0.0f;
+        const bool useSub = subLevel > 0.0f;
+        const bool useNoise = noiseLevel > 0.0f;
+
+        auto renderStack = [&](WavetableOscillator& core, std::array<WavetableOscillator, 4>& extras, float unison, float detune, float blend, float pan, bool isA)
+        {
+            const int voices = juce::jlimit(1, 5, (int) std::round(unison));
+            const float centerWeight = voices == 1 ? 1.0f : juce::jmap(blend, 0.0f, 1.0f, 0.84f, 0.42f);
+            const float sideWeight = voices == 1 ? 0.0f : (1.0f - centerWeight) / (float) (voices - 1);
+            const float voiceNorm = 0.72f / std::sqrt((float) voices);
+            float l = 0.0f, r = 0.0f;
+            for (int i = 0; i < voices; ++i)
+            {
+                const float spread = voices == 1 ? 0.0f : juce::jmap((float) i / (float) (voices - 1), -1.0f, 1.0f) * detune * 0.05f;
+                WavetableOscillator* osc = (i == 0 ? &core : &extras[(size_t) (i - 1)]);
+                const float baseFreq = isA ? hzA : hzB;
+                osc->setFrequency(baseFreq * (1.0f + spread));
+                const float phaseOffset = spread * 0.03f + 0.019f * (float) i;
+                const float s = osc->process(phaseOffset);
+                const float panPos = juce::jlimit(0.0f, 1.0f, pan + spread * 1.05f);
+                const float gain = (i == 0 ? centerWeight : sideWeight) * voiceNorm;
+                l += s * std::cos(juce::MathConstants<float>::halfPi * panPos) * gain;
+                r += s * std::sin(juce::MathConstants<float>::halfPi * panPos) * gain;
+            }
+            return StereoSample { l, r };
+        };
+
+        const auto oscOutA = useOscA ? renderStack(oscA, extraA, p.oscAUnison + p.comboAmount * 2.0f, p.oscADetune + macroReese * 0.25f, p.oscABlend, juce::jlimit(0.0f, 1.0f, p.oscAPan + modPan * 0.2f - macroReese * 0.15f), true) : StereoSample{};
+        const auto oscOutB = useOscB ? renderStack(oscB, extraB, p.oscBUnison + p.comboAmount * 2.0f, p.oscBDetune + macroReese * 0.25f, p.oscBBlend, juce::jlimit(0.0f, 1.0f, p.oscBPan - modPan * 0.2f + macroReese * 0.15f), false) : StereoSample{};
+        const float oscMonoA = 0.5f * (oscOutA.left + oscOutA.right);
+        const float oscMonoB = 0.5f * (oscOutB.left + oscOutB.right);
+        const float phaseTapA = std::sin(juce::MathConstants<float>::twoPi * (oscA.phase + 0.13f));
+        const float phaseTapB = std::sin(juce::MathConstants<float>::twoPi * (oscB.phase - 0.11f));
+
+        float subSample = 0.0f;
+        switch (p.subWave)
+        {
+            case 1: sub.setPosition(0.35f); break;
+            case 2: sub.setPosition(0.55f); break;
+            case 3: sub.setPosition(0.95f); break;
+            default: sub.setPosition(0.05f); break;
+        }
+        subSample = useSub ? sub.process() : 0.0f;
+        if (useSub && p.subHarmonic > 0.001f)
+        {
+            const float sub2 = std::sin(sub.phase * juce::MathConstants<float>::twoPi * 0.5f);
+            subSample += sub2 * (0.35f * p.subHarmonic);
+        }
+        subToneState += 0.18f * (subSample - subToneState);
+        subSample = juce::jmap(0.18f, subSample, subToneState);
+        subPostState += 0.10f * (subSample - subPostState);
+        subSample = std::tanh((0.82f * subSample + 0.18f * subPostState) * 1.25f) * subLevel;
+
+        float noiseRaw = useNoise ? noise.process() : 0.0f;
+        const float nphase = noise.phase;
+        if (p.noiseType == 1)
+            noiseRaw = (0.55f * noiseRaw + 0.45f * std::sin(juce::MathConstants<float>::twoPi * nphase * 12.0f)) * noiseLevel;
+        else if (p.noiseType == 2)
+            noiseRaw = (0.35f * noiseRaw + 0.65f * std::sin(juce::MathConstants<float>::twoPi * nphase * (21.0f + 7.0f * env3v))) * noiseLevel;
+        else if (p.noiseType == 3)
+            noiseRaw = std::tanh((noiseRaw + std::sin(juce::MathConstants<float>::twoPi * nphase * 5.0f)) * 2.5f) * noiseLevel;
+        else if (p.noiseType == 4)
+            noiseRaw = (0.45f * noiseRaw + 0.55f * std::sin(juce::MathConstants<float>::twoPi * (nphase + 0.08f * env2v) * (3.0f + 8.0f * p.vowelAmount))) * noiseLevel;
+        else if (p.noiseType == 5)
+            noiseRaw = (0.20f * noiseRaw + 0.80f * std::sin(juce::MathConstants<float>::twoPi * nphase * (36.0f + 22.0f * macroLaser))) * noiseLevel;
+        else if (p.noiseType == 6)
+            noiseRaw = std::tanh((noiseRaw + std::sin(juce::MathConstants<float>::twoPi * nphase * (9.0f + 6.0f * macroHornStab))) * 2.2f) * noiseLevel;
+        else if (p.noiseType == 7)
+            noiseRaw = (0.75f * noiseRaw + 0.25f * std::sin(juce::MathConstants<float>::twoPi * nphase * 1.1f)) * noiseLevel;
+        noiseDcState += 0.012f * (noiseRaw - noiseDcState);
+        noiseRaw -= noiseDcState;
+        const float noisePanL = std::cos(juce::MathConstants<float>::halfPi * p.noisePan);
+        const float noisePanR = std::sin(juce::MathConstants<float>::halfPi * p.noisePan);
+
+        float l = oscOutA.left * oscALevel + oscOutB.left * oscBLevel;
+        float r = oscOutA.right * oscALevel + oscOutB.right * oscBLevel;
+        const float comboMono = 0.5f * (l + r);
+        l += comboMono * p.comboAmount * 0.35f;
+        r += comboMono * p.comboAmount * 0.35f;
+
+        if (! p.subDirect) { l += subSample; r += subSample; }
+        if (! p.noiseDirect) { l += noiseRaw * noisePanL; r += noiseRaw * noisePanR; }
+
+        const float sourceLevel = oscALevel + oscBLevel + subLevel * 0.8f + noiseLevel * 0.7f;
+        const bool sourceMuted = sourceLevel <= 0.0005f;
+        const float sourcePresence = juce::jlimit(0.0f, 1.0f, sourceLevel * 0.45f);
+
+        if (sourceMuted)
+        {
+            const float silentAmp = env1.next() * velocity;
+            juce::ignoreUnused(silentAmp);
+            if (! held)
+            {
+                ++releaseSamples;
+                const int maxReleaseSamples = (int) (sampleRate * 6.0);
+                if (releaseSamples > maxReleaseSamples || ! env1.isActive())
+                    reset();
+            }
+            else
+            {
+                releaseSamples = 0;
+            }
+
+            if (! env1.isActive())
+                reset();
+
+            return {};
+        }
+
+        const float gentle = 1.0f - juce::jlimit(0.0f, 1.0f, p.toneAmount * 0.55f + p.airAmount * 0.30f);
+        const float toneTilt = juce::jmap(p.toneAmount, 0.0f, 1.0f, 0.18f, 1.65f);
+        const float toneSweep = 1.0f + (p.motionAmount * 0.12f + macroWomp * 0.28f + macroWhoop * 0.16f) * lfoValues[2] + p.growlAmount * 0.08f * env2v + p.vowelAmount * 0.14f * env3v;
+        const float cutoff = juce::jlimit(20.0f, 18000.0f, p.cutoff * toneTilt * toneSweep * std::pow(2.0f, modCutoff * 4.0f) * (1.0f + (macroWomp * 0.45f + p.motionAmount * 0.20f + macroWhoop * 0.10f) * lfoValues[0]));
+        const float resonance = juce::jlimit(0.1f, 1.15f, p.resonance + std::abs(modCutoff) * 0.2f);
+        filter.update(p.filterMode, cutoff, resonance);
+
+        const float preDrive = 1.0f + p.filterDrive * (1.9f + p.growlAmount * 0.7f) + p.toneAmount * 0.22f;
+        l = std::tanh(l * preDrive);
+        r = std::tanh(r * preDrive);
+        const auto filtered = filter.process(l, r);
+        l = juce::jmap(p.filterMix, l, filtered.left);
+        r = juce::jmap(p.filterMix, r, filtered.right);
+
+        if (sourcePresence > 0.001f && (macroWarhorn > 0.001f || macroHornStab > 0.001f))
+        {
+            const float hornL = std::sin(l * (4.0f + 12.0f * (macroWarhorn + 0.5f * macroHornStab)) + env2v * 3.0f + motion * 2.0f) * 0.35f;
+            const float hornR = std::sin(r * (4.0f + 12.0f * (macroWarhorn + 0.5f * macroHornStab)) + env2v * 3.0f - motion * 2.0f) * 0.35f;
+            l = std::tanh(l + hornL + (p.fmAmount + macroScreech * 0.20f) * (phaseTapB * 0.08f + oscMonoB * 0.05f));
+            r = std::tanh(r + hornR + (p.fmAmount + macroScreech * 0.20f) * (phaseTapA * 0.08f + oscMonoA * 0.05f));
+        }
+
+        if (p.growlAmount * sourcePresence > 0.001f)
+        {
+            const float ringL = std::sin((l + env2v * 0.3f) * (5.0f + 14.0f * p.growlAmount) + phaseTapA * 0.9f + oscMonoA * 0.5f);
+            const float ringR = std::sin((r + env2v * 0.3f) * (5.0f + 14.0f * p.growlAmount) + phaseTapB * 0.9f + oscMonoB * 0.5f);
+            l = juce::jmap(p.growlAmount * 0.55f, l, std::tanh(l + ringL * 0.45f));
+            r = juce::jmap(p.growlAmount * 0.55f, r, std::tanh(r + ringR * 0.45f));
+        }
+
+        if (p.subDirect) { l += subSample; r += subSample; }
+        if (p.noiseDirect) { l += noiseRaw * noisePanL; r += noiseRaw * noisePanR; }
+
+        const float distDrive = (p.distDrive + modDist * 0.12f + macroWarhorn * 0.06f + p.fmAmount * 0.05f + p.growlAmount * 0.08f + p.toneAmount * 0.03f + macroScreech * 0.05f + macroWhoop * 0.04f) * sourcePresence;
+        const float foldAmt = juce::jlimit(0.0f, 1.0f, (p.motionAmount * 0.18f + p.growlAmount * 0.12f + macroWarhorn * 0.08f) * sourcePresence);
+        auto waveShape = [&](float x)
+        {
+            const float clipped = std::tanh(x * (1.0f + distDrive * 8.0f));
+            const float folded = std::sin(x * (2.0f + 14.0f * foldAmt));
+            return juce::jmap(foldAmt, clipped, 0.55f * clipped + 0.45f * folded);
+        };
+        const float dirtyL = waveShape(l);
+        const float dirtyR = waveShape(r);
+        l = juce::jmap(p.distMix, l, dirtyL);
+        r = juce::jmap(p.distMix, r, dirtyR);
+
+        if (macroLaser * sourcePresence > 0.001f)
+        {
+            const float laserPhase = juce::MathConstants<float>::twoPi * (oscA.phase * (7.0f + 18.0f * macroLaser) + lfoValues[2] * 0.2f);
+            const float laserL = std::sin(laserPhase + l * (1.0f + 12.0f * macroLaser));
+            const float laserR = std::sin(laserPhase * 1.03f + r * (1.0f + 12.0f * macroLaser));
+            l = juce::jmap(0.35f * macroLaser, l, std::tanh(l + laserL * 0.45f));
+            r = juce::jmap(0.35f * macroLaser, r, std::tanh(r + laserR * 0.45f));
+        }
+
+        if (macroNeuro * sourcePresence > 0.001f)
+        {
+            const float neuroSweep = std::sin((oscA.phase - oscB.phase) * juce::MathConstants<float>::twoPi * (2.0f + 10.0f * macroNeuro));
+            l = juce::jmap(0.28f * macroNeuro, l, std::tanh((l + neuroSweep * 0.35f) * (1.0f + 2.5f * macroNeuro)));
+            r = juce::jmap(0.28f * macroNeuro, r, std::tanh((r - neuroSweep * 0.35f) * (1.0f + 2.5f * macroNeuro)));
+        }
+
+        if (macroScreech * sourcePresence > 0.001f)
+        {
+            const float screechL = std::sin((l + phaseTapA * 0.18f + oscMonoA * 0.12f) * (7.0f + 18.0f * macroScreech) + lfoValues[3] * 1.6f);
+            const float screechR = std::sin((r + phaseTapB * 0.18f + oscMonoB * 0.12f) * (7.0f + 18.0f * macroScreech) - lfoValues[3] * 1.6f);
+            l = juce::jmap(0.26f * macroScreech, l, std::tanh(l + screechL * 0.42f));
+            r = juce::jmap(0.26f * macroScreech, r, std::tanh(r + screechR * 0.42f));
+        }
+        if (macroWhoop * sourcePresence > 0.001f || p.vowelAmount * sourcePresence > 0.001f)
+        {
+            const float form = 0.5f + 0.5f * std::sin(env2v * 4.0f + lfoValues[0] * (2.0f + 3.0f * macroWhoop));
+            const float whoopL = std::sin((1.0f + 5.0f * form + 7.0f * p.vowelAmount) * l);
+            const float whoopR = std::sin((1.0f + 5.0f * (1.0f - form) + 7.0f * p.vowelAmount) * r);
+            l = juce::jmap(0.28f * (macroWhoop + p.vowelAmount), l, l + whoopL * 0.35f);
+            r = juce::jmap(0.28f * (macroWhoop + p.vowelAmount), r, r + whoopR * 0.35f);
+        }
+
+        const float bodyMono = 0.5f * (l + r);
+        l += std::tanh(bodyMono * 1.8f) * (0.32f * (p.bodyAmount + macroDonk * 0.5f));
+        r += std::tanh(bodyMono * 1.8f) * (0.32f * (p.bodyAmount + macroDonk * 0.5f));
+
+        const float smearTap = std::sin((oscA.phase + oscB.phase) * juce::MathConstants<float>::twoPi * (1.0f + 4.0f * p.smearAmount + 6.0f * macroVapor)) * (p.smearAmount + 0.4f * macroVapor) * 0.14f;
+        l += smearTap;
+        r -= smearTap;
+        const float mid = 0.5f * (l + r);
+        const float side = 0.5f * (l - r) * (0.25f + p.stereoWidth * 0.85f + macroReese * 0.35f + p.smearAmount * 0.25f);
+        l = mid + side;
+        r = mid - side;
+
+        const float monoSubGlue = p.subDirect ? 0.0f : (0.38f + 0.18f * p.bodyAmount) * subSample;
+        l += monoSubGlue;
+        r += monoSubGlue;
+        const float air = (p.airAmount + 0.16f * (p.toneAmount - 0.5f) + 0.14f * macroLaser + 0.10f * macroVapor) * 0.06f * sourcePresence;
+        l = std::tanh(l + (l - mid) * air);
+        r = std::tanh(r + (r - mid) * air);
+
+        const float smoothCoeff = juce::jlimit(0.03f, 0.62f, 0.10f + p.toneAmount * 0.14f + p.airAmount * 0.08f + macroLaser * 0.05f);
+        postToneL += smoothCoeff * (l - postToneL);
+        postToneR += smoothCoeff * (r - postToneR);
+        l = juce::jmap(0.72f * gentle, l, postToneL);
+        r = juce::jmap(0.72f * gentle, r, postToneR);
+
+        const float warmth = juce::jlimit(0.0f, 1.0f, 0.85f - (p.toneAmount * 0.55f + p.airAmount * 0.35f + macroLaser * 0.18f));
+        const float warmCoeff = 0.06f + 0.24f * warmth;
+        warmToneL += warmCoeff * (l - warmToneL);
+        warmToneR += warmCoeff * (r - warmToneR);
+        l = juce::jmap(0.12f + 0.58f * warmth, l, warmToneL);
+        r = juce::jmap(0.12f + 0.58f * warmth, r, warmToneR);
+
+        const float amp = env1.next() * velocity * juce::jlimit(0.0f, 2.0f, 1.0f + modLevel * 0.5f);
+        const float onsetLen = juce::jmax(24.0f, 0.0035f * (float) sampleRate);
+        const float onsetGain = juce::jlimit(0.0f, 1.0f, (float) onsetSamples / onsetLen);
+        ++onsetSamples;
+        l *= amp * onsetGain;
+        r *= amp * onsetGain;
+        l = std::tanh(l * 0.96f);
+        r = std::tanh(r * 0.96f);
+
+        if (! held)
+        {
+            ++releaseSamples;
+            const int maxReleaseSamples = (int) (sampleRate * 6.0);
+            if (releaseSamples > maxReleaseSamples || (! env1.isActive() && std::abs(l) + std::abs(r) < 0.00002f))
+                reset();
+        }
+        else
+        {
+            releaseSamples = 0;
+        }
+
+        if (! env1.isActive() && ! held && std::abs(l) + std::abs(r) < 0.00002f)
+            reset();
+
+        return { l, r };
+    }
+
+private:
+    double sampleRate = 44100.0;
+    bool active = false, held = false;
+    int midiNote = -1;
+    float velocity = 0.0f;
+    float currentHz = 110.0f, targetHz = 110.0f;
+    float basePan = 0.5f;
+    uint64_t age = 0;
+    int releaseSamples = 0;
+    int onsetSamples = 0;
+    float postToneL = 0.0f, postToneR = 0.0f;
+    float warmToneL = 0.0f, warmToneR = 0.0f;
+    float subToneState = 0.0f;
+    float subPostState = 0.0f;
+    float noiseDcState = 0.0f;
+
+    WavetableOscillator oscA, oscB, sub, noise;
+    std::array<WavetableOscillator, 4> extraA {}, extraB {};
+    ModEnvelope env1, env2, env3;
+    std::array<ShapedLfo, 4> lfos {};
+    FilterBlock filter;
+};
